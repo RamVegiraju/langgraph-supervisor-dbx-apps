@@ -11,3 +11,11 @@ venv/
 dist/
 build/
 .DS_Store
+
+# MLflow local store
+mlruns/
+mlflow.db
+*.db
+
+# uv lock files contain SHA hashes that occasionally trip secret scanners
+uv.lock

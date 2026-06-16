@@ -7,16 +7,16 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import RetryPolicy
 
-from agent.workers import build_finance_agent, build_weather_agent
+from agent.subagents import build_finance_agent, build_weather_agent
 
 SUPERVISOR_PROMPT = (
-    "You are a supervisor coordinating two specialist workers: "
-    "call_weather_worker (for weather questions) and call_finance_worker "
+    "You are a supervisor coordinating two specialist sub-agents: "
+    "call_weather_subagent (for weather questions) and call_finance_subagent "
     "(for currency conversion or exchange rates). "
-    "Delegate the user's question to the right worker — call both in parallel "
+    "Delegate the user's question to the right sub-agent — call both in parallel "
     "in a single turn if the question needs both. "
-    "After the workers respond, synthesize their answers into one short reply. "
-    "If the question does not need a worker (e.g. greetings), respond directly."
+    "After the sub-agents respond, synthesize their answers into one short reply. "
+    "If the question does not need a sub-agent (e.g. greetings), respond directly."
 )
 
 
@@ -36,9 +36,9 @@ def _extract_text(content) -> str:
 def build_agent(endpoint: str | None = None):
     """Build the supervisor graph.
 
-    Shape (same as Part 2's custom ReAct, but the tools are worker delegations):
+    Shape (same as Part 2's custom ReAct, but the tools are sub-agent delegations):
 
-        START -> supervisor --(tools_condition)--+-> workers -> supervisor
+        START -> supervisor --(tools_condition)--+-> subagents -> supervisor
                                                  +-> END
     """
     llm = ChatDatabricks(
@@ -50,7 +50,7 @@ def build_agent(endpoint: str | None = None):
     finance_agent = build_finance_agent()
 
     @tool
-    def call_weather_worker(query: str) -> str:
+    def call_weather_subagent(query: str) -> str:
         """Delegate a weather question to the weather specialist.
 
         Args:
@@ -60,7 +60,7 @@ def build_agent(endpoint: str | None = None):
         return _extract_text(result["messages"][-1].content)
 
     @tool
-    def call_finance_worker(query: str) -> str:
+    def call_finance_subagent(query: str) -> str:
         """Delegate a currency / FX question to the finance specialist.
 
         Args:
@@ -69,8 +69,8 @@ def build_agent(endpoint: str | None = None):
         result = finance_agent.invoke({"messages": [HumanMessage(query)]})
         return _extract_text(result["messages"][-1].content)
 
-    worker_tools = [call_weather_worker, call_finance_worker]
-    supervisor_llm = llm.bind_tools(worker_tools)
+    subagent_tools = [call_weather_subagent, call_finance_subagent]
+    supervisor_llm = llm.bind_tools(subagent_tools)
 
     def supervisor_node(state: MessagesState) -> dict:
         response = supervisor_llm.invoke(
@@ -85,11 +85,11 @@ def build_agent(endpoint: str | None = None):
             supervisor_node,
             retry_policy=RetryPolicy(max_attempts=3, initial_interval=1.0),
         )
-        .add_node("workers", ToolNode(worker_tools, handle_tool_errors=True))
+        .add_node("subagents", ToolNode(subagent_tools, handle_tool_errors=True))
         .add_edge(START, "supervisor")
         .add_conditional_edges(
-            "supervisor", tools_condition, {"tools": "workers", END: END}
+            "supervisor", tools_condition, {"tools": "subagents", END: END}
         )
-        .add_edge("workers", "supervisor")
+        .add_edge("subagents", "supervisor")
         .compile()
     )
