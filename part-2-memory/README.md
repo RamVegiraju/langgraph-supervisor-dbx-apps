@@ -1,46 +1,81 @@
 # Part 2 — Memory (Lakebase-backed)
 
-Adds two-tier memory to the Part 1 supervisor:
-
-1. **Short-term** — LangGraph `CheckpointSaver` per `(thread_id, user_id)`.
-   Carries the message history within and across turns of a single conversation.
-2. **Long-term** — `DatabricksStore` per `user_id`, with two namespaces:
-   - **episodic** — every turn auto-persists `{query, answer, sub-agents used}`.
-   - **semantic** — distilled stable preferences (explicit or inferred).
-     Written by a separate LLM distillation pass.
-
-Both backed by one Lakebase Autoscale project, isolated by branch.
+Adds three memory layers on top of the Part 1 supervisor, all backed by one
+Lakebase Autoscale project. Aligned with the
+[Databricks Memory Scaling blog](https://www.databricks.com/blog/memory-scaling-ai-agents)
+terminology: episodic memories are raw records of past interactions; semantic
+memories are generalized facts distilled from them.
 
 > Part 2 is intentionally a prototype. Known limitations and the production
-> evolution path are listed at the bottom of this README.
+> evolution path are at the bottom of this README.
 
-## Architecture
+## The three memory layers
+
+| | **Checkpointer** (short-term) | **Episodic** (long-term, raw) | **Semantic** (long-term, distilled) |
+|---|---|---|---|
+| **What it captures** | Full message list + cached memory context at every step of the graph | One `{query, answer, sub-agents used, thread_id, occurred_at}` per user turn | One stable preference per row: `{value, confidence, stated_by_user, updated_at}` |
+| **Granularity** | One row per node firing | One row per turn | One row per distinct preference |
+| **When written** | After every node firing (~5× per turn) | At the end of every turn (`persist_episode` node) | "🏁 End & start new conversation" button OR `distill.py` CLI |
+| **Who writes it** | LangGraph runtime auto-persists state | A graph node — pure data extraction, no LLM | A separate LLM call (the distiller) reads recent episodes and proposes updates |
+| **Read pattern** | Auto-loaded by LangGraph at the start of every `invoke()` for the active `thread_id` | Top-3 by **pgvector cosine similarity** to the current user query, loaded into the supervisor's system prompt every turn | All rows loaded into the supervisor's system prompt every turn (no vector search — small per-user table) |
+| **Format & where** | msgpack binary in `checkpoints` + `checkpoint_blobs` tables, keyed by `(thread_id, checkpoint_ns, checkpoint_id)` | JSONB in `store` + 1024-dim embedding in `store_vectors`, namespace `memories.episodic.<user_id>` | JSONB in `store` + 1024-dim embedding in `store_vectors`, namespace `memories.semantic.<user_id>` |
+
+### What happens in one turn
 
 ```
-   Streamlit UI ──► Supervisor graph
-       │                │
-       │                ├─ load_memory_context  (all semantic + top-3 episodic via vector)
-       │                ├─ LLM call (2 sub-agent tools bound)
-       │                ├─ (tool_calls → subagents → loop)
-       │                └─ persist_episode      (one row per user turn)
-       │
-       └─► "🏁 End & start new conversation" button
-                │
-                └─ distill_user: one LLM call over recent episodes,
-                                  produces add/update/delete on semantic namespace
+User: "What's the weather in Paris?"
+  │
+  ├─► [checkpointer load]     prior state for this thread_id (empty for new thread)
+  │
+  ├─► supervisor node
+  │     ├─► load_memory_context:
+  │     │     • SELECT all rows in memories.semantic.<user_id>       (plain SQL)
+  │     │     • embed("What's the weather in Paris?") → 1024-dim
+  │     │     • SELECT top-3 from memories.episodic.<user_id>
+  │     │       ORDER BY embedding <=> :query_vector LIMIT 3         (pgvector!)
+  │     ├─► LLM call → AIMessage(tool_calls=[call_weather_subagent])
+  │     └─► [checkpointer write]
+  │
+  ├─► subagents node → runs sub-agent → ToolMessage
+  │     └─► [checkpointer write]
+  │
+  ├─► supervisor node (synthesis) → AIMessage("Paris is 20°C…")
+  │     └─► [checkpointer write]
+  │
+  ├─► persist_episode node
+  │     ├─► extract last HumanMessage and last AIMessage from state
+  │     ├─► store.put(("memories","episodic",user_id), random_id, {  ◄── EPISODIC write
+  │     │       query: "What's the weather in Paris?",
+  │     │       answer: "Paris is 20°C, cloudy",
+  │     │       subagents_used: ["weather"],
+  │     │       thread_id: "...",
+  │     │       occurred_at: "...",
+  │     │       distilled_at: null })
+  │     └─► [checkpointer write]
+  │
+  └─► END
+```
 
-   ┌────────────── Lakebase Autoscale ───────────────┐
-   │  project: langgraph-supervisor-memory            │
-   │    └─ branch: production   (untouched until deploy) │
-   │    └─ branch: development  (day-to-day)          │
-   │                                                  │
-   │  Per-branch tables (auto-created):               │
-   │    LangGraph checkpoints (4 tables)              │
-   │    DatabricksStore namespaces:                   │
-   │      ("memories", "episodic", user_id)           │
-   │      ("memories", "semantic", user_id)           │
-   │      ("meta",     user_id)   # last-distill mark │
-   └──────────────────────────────────────────────────┘
+Semantic is **not** written this turn. It only gets written when:
+- The user clicks the end-of-conversation button → `distill_user` reads recent
+  episodic rows, makes one LLM call to propose preference updates, writes them
+  to the semantic namespace, marks the episodes as `distilled_at=now()`.
+- OR you run `python distill.py --user <id>` manually.
+
+### Where it all lives
+
+```
+Lakebase Autoscale  /  project langgraph-supervisor-memory  /  branch development
+
+  Checkpointer (short-term)              Store (long-term)
+  ─────────────────────────              ─────────────────────────────────
+  checkpoints                            store
+  checkpoint_blobs                       store_vectors  (1024-dim embeddings)
+  checkpoint_writes                          ↑
+  checkpoint_migrations                      └ namespaces:
+                                                ("memories","episodic",<user_id>)
+                                                ("memories","semantic",<user_id>)
+                                                ("meta",<user_id>)
 ```
 
 ## Branching strategy
@@ -102,17 +137,18 @@ uv run python distill.py --user alice@example.com --min-episodes 1
 | `.env.example` | Template incl. `LAKEBASE_AUTOSCALING_*` and embedding endpoint |
 | `pyproject.toml` | Adds `databricks-sdk>=0.81.0`, `pydantic`, `databricks-langchain[memory]` |
 
-## How updates happen today
+## Distillation: how semantic gets written
 
-| Layer | Read | Write | Trigger |
-|---|---|---|---|
-| Short-term checkpoint | Auto by LangGraph each `invoke()` | Auto each node firing | Every turn |
-| Episodic | Top-3 vector search at supervisor entry | `persist_episode` node | Every turn |
-| Semantic | All items loaded into supervisor system prompt | LLM-proposed updates from distiller | "End & start new conversation" button click, or `distill.py` |
+When the distiller runs, it makes one LLM call over recent undistilled
+episodic rows and tags each proposed semantic update as either:
 
-The distiller marks new semantic entries with `stated_by_user: true` (high
-confidence, ≥0.9) when it detects an explicit user statement in the episodes,
-and `stated_by_user: false` (0.5-0.8 confidence) for inferred patterns.
+- **`stated_by_user: true`** with **confidence ≥ 0.9** — user explicitly said
+  it ("remember I prefer Fahrenheit").
+- **`stated_by_user: false`** with **confidence 0.5–0.8** — inferred from a
+  recurring pattern across multiple turns.
+
+Updates merge into `memories.semantic.<user_id>` by key; old episodes get
+their `distilled_at` set so they aren't reprocessed.
 
 ---
 
