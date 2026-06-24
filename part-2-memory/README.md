@@ -7,11 +7,15 @@ Terminology follows two Databricks references:
 
 - [Memory Scaling](https://www.databricks.com/blog/memory-scaling-ai-agents) —
   *episodic* memories are raw records of past interactions; *semantic* memories
-  are generalized facts distilled from them.
+  are generalized facts distilled from them. The payoff comes from keeping
+  memory **efficient** — distilling raw turns into a few stable facts and
+  retrieving only what's relevant per query — not from piling more context into
+  the prompt, which dilutes it. No retraining either way.
 - [MemAlign](https://www.databricks.com/blog/memalign-building-better-llm-judges-human-feedback-scalable-memory) —
-  the **dual-memory** pattern: semantic *principles* + episodic *examples*,
-  assembled per call into a **working memory**. See
-  [MemAlign mapping](#memalign-mapping) below.
+  the **dual-memory** idea this borrows: distilled semantic *principles* +
+  retrieved episodic *examples*, assembled per call. (MemAlign itself targets
+  LLM judges aligned by expert feedback; here memory is built automatically from
+  user turns, so this takes the shape, not the whole framework.)
 
 > Part 2 is intentionally a prototype. Known limitations and the production
 > evolution path are at the bottom of this README.
@@ -69,21 +73,6 @@ Semantic is **not** written this turn. It's written only when distillation runs
 (the "End conversation" button or `distill.py`): `distill_user` reads recent
 episodic rows, makes one LLM call to propose preference updates, writes them to
 the semantic namespace, and marks those episodes `distilled_at=now()`.
-
-### MemAlign mapping
-
-This system applies MemAlign's dual-memory pattern (built there for LLM judges)
-to an agent:
-
-| MemAlign concept | Here |
-|---|---|
-| **Dual-memory system** | The episodic + semantic stores |
-| **Semantic memory** (general principles) | Distilled user preferences — *all* loaded into the prompt |
-| **Episodic memory** (specific examples) | Raw per-turn interactions — *top-3 relevant* retrieved |
-| **Alignment stage** (NL feedback → principles) | `distill_user` — reads episodes, distills preferences |
-| **Inference stage → "working memory"** | `load_semantic_context` + `load_episodic_context`, assembled into the supervisor's system prompt |
-| **Natural-language feedback** over labels | Users state prefs in plain language ("remember I prefer Fahrenheit") |
-| **Memory scaling** | Quality improves as episodes accumulate — no retraining |
 
 ### Where it all lives
 

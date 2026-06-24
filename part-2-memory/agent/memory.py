@@ -116,7 +116,7 @@ def get_session_summaries(store: BaseStore, user_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Context loading — assembles the supervisor's "working memory" (MemAlign term)
+# Context loading — assembles the supervisor's working-memory context
 #
 # Split into two functions because the two reads have different lifetimes:
 #   - semantic is query-INdependent  -> load once per thread, then cache
