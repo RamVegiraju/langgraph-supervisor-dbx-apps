@@ -11,19 +11,29 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.store.base import BaseStore
 from langgraph.types import RetryPolicy
 
-from agent.memory import load_memory_context, persist_episode
+from agent.memory import (
+    load_episodic_context,
+    load_semantic_context,
+    persist_episode,
+)
 from agent.subagents import build_finance_agent, build_weather_agent
 
 
 class State(MessagesState):
     """State for the supervisor graph.
 
-    Extends MessagesState with `memory_context` — a cached snapshot of the
-    user's loaded memory for the duration of one invoke(). Set on the routing
-    pass, reused on the synthesis pass after sub-agents return. Invalidated
-    automatically at the start of the next turn because the routing pass
-    always recomputes when the last message is a HumanMessage.
+    Two memory caches ride on top of MessagesState:
+
+    - `semantic_context`: the user's KNOWN_USER_PREFERENCES block. Query-
+      independent, so it's loaded ONCE on the first turn of a thread and then
+      reused (the checkpointer rehydrates it on later turns). `None` until
+      loaded; `""` means "loaded, user has no prefs" — both skip a re-query.
+
+    - `memory_context`: the full working-memory string (semantic + the per-turn
+      episodic block) for the current turn. Recomputed each routing pass and
+      reused on the synthesis pass after sub-agents return.
     """
+    semantic_context: Optional[str]
     memory_context: str
 
 SUPERVISOR_PROMPT = (
@@ -114,7 +124,18 @@ def build_agent(
 
         if is_routing_pass and user_id and store is not None:
             query = str(msgs[-1].content)
-            context = load_memory_context(store, user_id=user_id, query=query)
+
+            # Episodic is query-dependent -> reload every turn.
+            episodic = load_episodic_context(store, user_id=user_id, query=query)
+
+            # Semantic is query-independent -> load once per thread, then reuse
+            # the checkpointed value. None = not yet loaded; "" = loaded, empty.
+            semantic = state.get("semantic_context")
+            if semantic is None:
+                semantic = load_semantic_context(store, user_id=user_id)
+                update["semantic_context"] = semantic
+
+            context = "\n".join(p for p in (semantic, episodic) if p)
             update["memory_context"] = context
         else:
             context = state.get("memory_context", "")

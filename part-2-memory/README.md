@@ -1,10 +1,17 @@
 # Part 2 — Memory (Lakebase-backed)
 
-Adds three memory layers on top of the Part 1 supervisor, all backed by one
-Lakebase Autoscale project. Aligned with the
-[Databricks Memory Scaling blog](https://www.databricks.com/blog/memory-scaling-ai-agents)
-terminology: episodic memories are raw records of past interactions; semantic
-memories are generalized facts distilled from them.
+Three memory layers on top of the Part 1 supervisor, all backed by one Lakebase
+Autoscale project.
+
+Terminology follows two Databricks references:
+
+- [Memory Scaling](https://www.databricks.com/blog/memory-scaling-ai-agents) —
+  *episodic* memories are raw records of past interactions; *semantic* memories
+  are generalized facts distilled from them.
+- [MemAlign](https://www.databricks.com/blog/memalign-building-better-llm-judges-human-feedback-scalable-memory) —
+  the **dual-memory** pattern: semantic *principles* + episodic *examples*,
+  assembled per call into a **working memory**. See
+  [MemAlign mapping](#memalign-mapping) below.
 
 > Part 2 is intentionally a prototype. Known limitations and the production
 > evolution path are at the bottom of this README.
@@ -13,75 +20,95 @@ memories are generalized facts distilled from them.
 
 | | **Checkpointer** (short-term) | **Episodic** (long-term, raw) | **Semantic** (long-term, distilled) |
 |---|---|---|---|
-| **What it captures** | Full message list + cached memory context at every step of the graph | One `{query, answer, sub-agents used, thread_id, occurred_at}` per user turn | One stable preference per row: `{value, confidence, stated_by_user, updated_at}` |
+| **What it captures** | Full message list + cached memory context at every step | One `{query, answer, sub-agents used, thread_id, occurred_at}` per turn | One stable preference per row: `{value, confidence, stated_by_user, updated_at}` |
 | **Granularity** | One row per node firing | One row per turn | One row per distinct preference |
-| **When written** | After every node firing (~5× per turn) | At the end of every turn (`persist_episode` node) | "🏁 End & start new conversation" button OR `distill.py` CLI |
-| **Who writes it** | LangGraph runtime auto-persists state | A graph node — pure data extraction, no LLM | A separate LLM call (the distiller) reads recent episodes and proposes updates |
-| **Read pattern** | Auto-loaded by LangGraph at the start of every `invoke()` for the active `thread_id` | Top-3 by **pgvector cosine similarity** to the current user query, loaded into the supervisor's system prompt every turn | All rows loaded into the supervisor's system prompt every turn (no vector search — small per-user table) |
-| **Format & where** | msgpack binary in `checkpoints` + `checkpoint_blobs` tables, keyed by `(thread_id, checkpoint_ns, checkpoint_id)` | JSONB in `store` + 1024-dim embedding in `store_vectors`, namespace `memories.episodic.<user_id>` | JSONB in `store` + 1024-dim embedding in `store_vectors`, namespace `memories.semantic.<user_id>` |
+| **When written** | After every node firing (~5× per turn) | End of every turn (`persist_episode` node) | "🏁 End conversation" button OR `distill.py` |
+| **Who writes it** | LangGraph runtime (auto) | A graph node — pure data extraction, no LLM | The distiller — one LLM call over recent episodes |
+| **How it's read** | Auto-loaded by LangGraph each `invoke()` for the active `thread_id` | **Top-3 by pgvector cosine similarity** to the current query — reloaded **every turn** | **All** rows, no vector search — loaded **once per thread** and cached in graph state |
+| **Format & where** | msgpack in `checkpoints` + `checkpoint_blobs`, keyed by `(thread_id, checkpoint_ns, checkpoint_id)` | JSONB in `store` + embedding in `store_vectors`, ns `memories.episodic.<user_id>` | JSONB in `store` + embedding in `store_vectors`, ns `memories.semantic.<user_id>` |
+
+**Why semantic loads once but episodic every turn:** semantic prefs don't depend
+on the question (same answer regardless of what's asked), so they're loaded on
+the first turn of a thread and reused from graph state thereafter. Episodic
+recall *is* query-dependent (top-3 most similar past turns), so it's recomputed
+each turn. This saves one embedding round-trip + one query on every turn after
+the first.
 
 ### What happens in one turn
 
 ```
 User: "What's the weather in Paris?"
   │
-  ├─► [checkpointer load]     prior state for this thread_id (empty for new thread)
+  ├─► [checkpointer load]   prior state for this thread_id (empty for a new thread)
   │
-  ├─► supervisor node
-  │     ├─► load_memory_context:
-  │     │     • SELECT all rows in memories.semantic.<user_id>       (plain SQL)
-  │     │     • embed("What's the weather in Paris?") → 1024-dim
-  │     │     • SELECT top-3 from memories.episodic.<user_id>
-  │     │       ORDER BY embedding <=> :query_vector LIMIT 3         (pgvector!)
-  │     ├─► LLM call → AIMessage(tool_calls=[call_weather_subagent])
-  │     └─► [checkpointer write]
+  ├─► supervisor node  — assembles "working memory":
+  │     ├─ load_episodic_context  (EVERY turn, query-dependent):
+  │     │     embed(query) → 1024-dim
+  │     │     SELECT top-3 FROM memories.episodic.<user_id>
+  │     │       ORDER BY embedding <=> :query_vector LIMIT 3      (pgvector)
+  │     ├─ load_semantic_context  (FIRST turn only, then cached in state):
+  │     │     SELECT all rows FROM memories.semantic.<user_id>    (plain SQL)
+  │     ├─ LLM call → AIMessage(tool_calls=[call_weather_subagent])
+  │     └─ [checkpointer write]
   │
   ├─► subagents node → runs sub-agent → ToolMessage
-  │     └─► [checkpointer write]
+  │     └─ [checkpointer write]
   │
   ├─► supervisor node (synthesis) → AIMessage("Paris is 20°C…")
-  │     └─► [checkpointer write]
+  │     └─ reuses cached working memory · [checkpointer write]
   │
-  ├─► persist_episode node
-  │     ├─► extract last HumanMessage and last AIMessage from state
-  │     ├─► store.put(("memories","episodic",user_id), random_id, {  ◄── EPISODIC write
-  │     │       query: "What's the weather in Paris?",
-  │     │       answer: "Paris is 20°C, cloudy",
-  │     │       subagents_used: ["weather"],
-  │     │       thread_id: "...",
-  │     │       occurred_at: "...",
-  │     │       distilled_at: null })
-  │     └─► [checkpointer write]
+  ├─► persist_episode node                                        ◄── EPISODIC write
+  │     store.put(("memories","episodic",user_id), id, {
+  │       query, answer, subagents_used, thread_id, occurred_at, distilled_at: null })
+  │     └─ [checkpointer write]
   │
   └─► END
 ```
 
-Semantic is **not** written this turn. It only gets written when:
-- The user clicks the end-of-conversation button → `distill_user` reads recent
-  episodic rows, makes one LLM call to propose preference updates, writes them
-  to the semantic namespace, marks the episodes as `distilled_at=now()`.
-- OR you run `python distill.py --user <id>` manually.
+Semantic is **not** written this turn. It's written only when distillation runs
+(the "End conversation" button or `distill.py`): `distill_user` reads recent
+episodic rows, makes one LLM call to propose preference updates, writes them to
+the semantic namespace, and marks those episodes `distilled_at=now()`.
+
+### MemAlign mapping
+
+This system applies MemAlign's dual-memory pattern (built there for LLM judges)
+to an agent:
+
+| MemAlign concept | Here |
+|---|---|
+| **Dual-memory system** | The episodic + semantic stores |
+| **Semantic memory** (general principles) | Distilled user preferences — *all* loaded into the prompt |
+| **Episodic memory** (specific examples) | Raw per-turn interactions — *top-3 relevant* retrieved |
+| **Alignment stage** (NL feedback → principles) | `distill_user` — reads episodes, distills preferences |
+| **Inference stage → "working memory"** | `load_semantic_context` + `load_episodic_context`, assembled into the supervisor's system prompt |
+| **Natural-language feedback** over labels | Users state prefs in plain language ("remember I prefer Fahrenheit") |
+| **Memory scaling** | Quality improves as episodes accumulate — no retraining |
 
 ### Where it all lives
 
-```
-Lakebase Autoscale  /  project langgraph-supervisor-memory  /  branch development
+`project langgraph-supervisor-memory / branch development`. Two subsystems, each
+splitting its data from a library-managed `*_migrations` version table:
 
-  Checkpointer (short-term)              Store (long-term)
-  ─────────────────────────              ─────────────────────────────────
-  checkpoints                            store
-  checkpoint_blobs                       store_vectors  (1024-dim embeddings)
-  checkpoint_writes                          ↑
-  checkpoint_migrations                      └ namespaces:
-                                                ("memories","episodic",<user_id>)
-                                                ("memories","semantic",<user_id>)
-                                                ("meta",<user_id>)
+| Table(s) | Holds |
+|---|---|
+| `checkpoints` · `checkpoint_blobs` · `checkpoint_writes` | **Short-term**: per-`thread_id` state snapshots (index · payload · pending writes) |
+| `store` | **Long-term values** (JSONB) — episodic episodes + semantic prefs |
+| `store_vectors` | **Long-term embeddings** (1024-dim) for pgvector similarity search |
+
+Every searchable item appears in **both** `store` (its value) and `store_vectors`
+(its embedding). Inside both, rows are grouped by namespace:
+
+```
+("memories","episodic",<user_id>)   raw turns
+("memories","semantic",<user_id>)   distilled prefs
+("meta",<user_id>)                  distillation watermark
 ```
 
 ## Branching strategy
 
-Lakebase Autoscale branches are copy-on-write — cheap to spawn, isolated.
-Treat them like git branches:
+Lakebase Autoscale branches are copy-on-write — cheap to spawn, isolated. Treat
+them like git branches:
 
 | Branch | Purpose | When you touch it |
 |---|---|---|
@@ -119,6 +146,9 @@ uv run python main.py --with-memory --user-id alice@example.com --thread-id demo
 
 # Force a distillation pass on demand
 uv run python distill.py --user alice@example.com --min-episodes 1
+
+# Seed the tables with demo traffic across several users, then distill each
+uv run python populate_demo.py
 ```
 
 ## Files
@@ -127,110 +157,75 @@ uv run python distill.py --user alice@example.com --min-episodes 1
 |---|---|
 | `agent/tools.py` | 6 raw tool functions (unchanged from Part 1) |
 | `agent/subagents.py` | Weather + finance sub-agents (unchanged) |
-| `agent/graph.py` | Supervisor graph — loads memory context, persists episodes |
-| `agent/memory.py` | Namespaces, `persist_episode`, `load_memory_context`, sidebar helpers |
-| `agent/distiller.py` | L2 distillation — `distill_user(...)` (LLM call + JSON parse + merge) |
+| `agent/graph.py` | Supervisor graph — assembles working memory, persists episodes |
+| `agent/memory.py` | Namespaces, `persist_episode`, `load_semantic_context` / `load_episodic_context`, sidebar helpers |
+| `agent/distiller.py` | Distillation — `distill_user(...)` (LLM call + JSON parse + merge) |
 | `app.py` | Streamlit UI — user_id sidebar, Lakebase init, streaming, "End & save" button |
 | `main.py` | CLI — `--with-memory` opt-in |
 | `provision_lakebase.py` | One-shot Lakebase project + dev branch creation |
-| `distill.py` | On-demand CLI for L2 distillation |
+| `distill.py` | On-demand CLI for distillation |
+| `populate_demo.py` | Dev seeder — replays multi-turn conversations across several users, then distills each |
 | `.env.example` | Template incl. `LAKEBASE_AUTOSCALING_*` and embedding endpoint |
 | `pyproject.toml` | Adds `databricks-sdk>=0.81.0`, `pydantic`, `databricks-langchain[memory]` |
 
 ## Distillation: how semantic gets written
 
-When the distiller runs, it makes one LLM call over recent undistilled
-episodic rows and tags each proposed semantic update as either:
+When the distiller runs, it makes one LLM call over recent undistilled episodic
+rows and tags each proposed semantic update as either:
 
-- **`stated_by_user: true`** with **confidence ≥ 0.9** — user explicitly said
-  it ("remember I prefer Fahrenheit").
-- **`stated_by_user: false`** with **confidence 0.5–0.8** — inferred from a
-  recurring pattern across multiple turns.
+- **`stated_by_user: true`**, confidence **≥ 0.9** — user explicitly said it
+  ("remember I prefer Fahrenheit").
+- **`stated_by_user: false`**, confidence **0.5–0.8** — inferred from a recurring
+  pattern across turns.
 
-Updates merge into `memories.semantic.<user_id>` by key; old episodes get
-their `distilled_at` set so they aren't reprocessed.
+Updates merge into `memories.semantic.<user_id>` by key; processed episodes get
+`distilled_at` set so they aren't reprocessed.
 
 ---
 
 # Known limitations & production evolution path
 
-This is a prototype. Below is what we *know* is rough about the current
-implementation and the direction each piece should evolve in for production.
+This is a prototype. Each row is **what's rough now → where it should go**. Listed
+up front so anyone reading the code knows where the seams are; Part 3 (or beyond)
+hardens most of them.
 
-## Memory architecture
-
-| Limitation | Production evolution |
-|---|---|
-| **Confidence score is LLM-judged vibes**, not a calibrated probability. Different distillation runs can pick different numbers for the same input. | Count-based reinforcement: each distillation increments a `times_observed` counter; `confidence = min(1.0, times_observed / N)`. Number becomes a real signal. |
-| **All semantic prefs loaded unconditionally** into every supervisor system prompt. Scales linearly with prefs per user (currently capped at `limit=20`). | (a) Confidence threshold filter (load only `confidence >= 0.6`). (b) Vector search relevance: if a user has >20 prefs, load top-k similar to the current query instead of all. |
-| **No memory decay or pruning**. Semantic prefs persist forever; old ones can become stale or contradictory. | Time-based decay (`new_conf = old_conf * 0.95^days_since_update`); periodic consolidation job that prunes anything below threshold. |
-| **No conflict resolution between similar keys**. Distiller can produce `temp_unit_pref` AND `preferred_temperature_unit` for the same idea over time. | Distillation step that semantically clusters keys and merges duplicates; or a pre-defined `Literal[...]` enum of valid keys to constrain the LLM. |
-| **`DatabricksStore` embeds the whole JSON value on every write** — including fields that aren't used for search. | Set `embedding_fields=["query"]` so only the relevant text gets embedded; save compute and improve search quality. |
-| **Episode schema is minimal** — just `{query, answer, sub-agents used, timestamps}`. No token counts, model used, latency, cost. | Richer episode payload with `token_usage`, `model_endpoint`, `latency_ms`, `tools_called` — enables cost reporting, perf analysis, evaluation. |
-| **Episodic stored per-turn with no rollup** — storage grows linearly with turns (~5.5 KB/turn ≈ 20 MB/year for a heavy user; fine for now, unbounded long-term). Per-turn is intentional — distillation needs fine-grained frequency signal, and you can derive coarser views from fine, not the reverse. | Layered storage: keep per-turn raw for recent ~90 days (feeds distillation + similarity search), then a scheduled consolidation job collapses old turns into per-conversation summary rows under a new `("memories", "sessions", user_id)` namespace and prunes the raw rows. TTL keeps total bounded; summaries keep "browse my history" UX working forever. |
-| **No schema versioning** on stored values. Changing the episode shape will break readers of old rows. | Add a `schema_version` field; readers branch on it; or run a one-shot migration job to upgrade old rows. |
-
-## Distillation
+## Memory & distillation
 
 | Limitation | Production evolution |
 |---|---|
-| **Distillation triggers only on explicit "End conversation" button**. Tab-close = orphaned episodes that may never get distilled. | Scheduled **Databricks Job** that runs nightly (or hourly), scans all users with undistilled episodes older than N hours, distills them. Plus retain the End button for the in-app explicit flow. |
-| **Distillation is non-deterministic** — same episodes can produce different semantic updates across runs. | Run distillation in a fixed-seed mode, OR compute deterministically via clustering+counting before involving the LLM, OR run N times and take majority vote. |
-| **Distiller can hallucinate preferences** with no validation against actual user behavior. | Hold proposed updates in a `pending` namespace; require confirmation before merging into `semantic`. For high-stakes prefs, surface them in the UI for the user to confirm. |
-| **Distillation prompt embedded in code**, not versioned. Can't A/B test or roll back. | Move prompts into a versioned registry (MLflow Prompt Registry or simple Git-tracked JSON) with the prompt version recorded on each `last_distill` meta entry. |
-| **Distillation reads ALL episodes each time and filters in Python** for `distilled_at IS NULL`. | Use `store.search(..., filter={"distilled_at": None})` if the store supports filter pushdown, or maintain a `meta.last_distilled_episode_id` watermark to skip processed rows in SQL. |
-| **No "dry run" or audit log** for distillation. Can't preview what would change before applying. | Add `distill_user(..., dry_run=True)` returning the proposed updates without applying. Write a row to a `distillation_audits` table on every real run. |
-| **No rollback path** — once distillation applies updates, no way to undo. | Soft-delete model: keep old semantic rows with a `superseded_at` timestamp; ability to "rewind to point-in-time" using Lakebase branching. |
+| Confidence is LLM-guessed, not calibrated — same input can score differently across runs. | Count-based reinforcement: `confidence = min(1, times_observed / N)`. |
+| **All** semantic prefs load into the prompt (no confidence/relevance filter; capped at 20). | Filter by `confidence >= 0.6`; switch to vector top-k once a user exceeds ~20 prefs. |
+| No decay or pruning — prefs live forever and can go stale or contradict. | Time-decay (`conf *= 0.95^days`) + a consolidation job that prunes below threshold. |
+| No conflict resolution — distiller can emit `temp_unit` *and* `preferred_temperature_unit` for one idea. | Cluster + merge duplicate keys, or constrain keys to a fixed `Literal[...]` enum. |
+| Distillation only fires on the "End conversation" button — tab-close orphans episodes. | Nightly Databricks Job distills any user with stale undistilled episodes (keep the button too). |
+| Distillation is non-deterministic and can hallucinate prefs. | Fixed-seed / majority-vote; stage proposals in a `pending` ns and confirm before merging. |
+| `DatabricksStore` embeds the whole JSON value, not just the searchable text. | `embedding_fields=["query"]` — cheaper writes, better recall. |
+| Episode schema is minimal and stored per-turn with no rollup (grows ~20 MB/yr/heavy user). | Richer payload (tokens, latency, cost); keep raw ~90d, then roll up to per-session summaries + TTL. |
+| No schema versioning on stored values — shape changes break old readers. | Add `schema_version`; branch on read, or migrate old rows once. |
 
-## LLM cost / latency
+Per-turn episodic storage is **intentional** — distillation needs fine-grained
+frequency signal, and you can derive coarse views from fine, not the reverse.
 
-| Limitation | Production evolution |
-|---|---|
-| **GPT-5.5 is used for every LLM call** — supervisor routing, sub-agent reasoning, sub-agent synthesis, supervisor synthesis, distillation. | Tier the models: supervisor routing → cheaper/faster (e.g. Llama-3-70b), sub-agents → GPT-5.5 only for hard reasoning, distillation → small model with structured-output support. Could halve cost. |
-| **4 LLM calls per turn for tool-using queries** (supervisor routes → worker reasons → worker synthesizes → supervisor synthesizes). | (a) For single-subagent queries, skip the supervisor synthesis and return the worker's answer directly. (b) Or switch to a "handoff" pattern where sub-agents write the user-facing reply themselves. |
-| **`with_structured_output` doesn't work cleanly with GPT-5.5 Responses API** — we fall back to JSON-in-prompt + regex-cleaned parse, which is fragile. | Either switch the distillation model to one that supports clean structured output, OR validate aggressively and fall back to a retry loop, OR migrate to JSON Schema mode once databricks-langchain supports it for the Responses API. |
-| **Per-sub-agent prompts are hardcoded**; can't be tuned per user/context. | Make prompts loadable from the store at runtime so they can be A/B tested or personalized. |
-
-## Operational
+## LLM cost & latency
 
 | Limitation | Production evolution |
 |---|---|
-| **`load_memory_context` runs on every supervisor firing** — twice per tool-using turn. Same SQL, same embedding, redundant. *Fixed in this iteration via a `memory_context` state field.* | Already fixed — keep an eye on cache invalidation if we add user-impact mid-turn (e.g., a tool that updates a preference). |
-| **All store/checkpoint operations are sync** — works for local Streamlit but blocks the event loop. | For Databricks Apps deployment, swap to `AsyncCheckpointSaver` + `AsyncDatabricksStore` + FastAPI handlers (the Databricks template's pattern). |
-| **MLflow async tracing disabled** for local dev (so traces appear instantly). | Re-enable for production via env var; tail latency goes down. |
-| **No connection pool tuning** — defaults from `databricks-langchain`. | Tune pool size to expected concurrency; monitor connection saturation in production. |
-| **No automatic Lakebase OAuth token refresh in long-running workers**. The library handles short ops but a multi-hour distillation could hit the 1h expiry. | Wrap long-running ops in a retry-on-401 with re-auth; or chunk into batches that complete inside 1h. |
-| **No retry policy on distillation** if the LLM call fails or returns malformed JSON. | Add backoff + retry with stricter system prompt on each attempt; flag persistent failures in MLflow. |
+| GPT-5.5 on every call (routing, both sub-agent steps, synthesis, distillation). | Tier models: cheap/fast for routing + distillation, GPT-5.5 only for hard reasoning. |
+| 4 LLM calls per tool-using turn. | Skip supervisor synthesis for single-sub-agent queries, or hand off the reply to the sub-agent. |
+| `with_structured_output` is fragile on the GPT-5.5 Responses API — falls back to regex JSON parse. | Use a model with clean structured output, or JSON Schema mode once supported. |
 
-## Identity & security
+## Operational & security
 
 | Limitation | Production evolution |
 |---|---|
-| **User_id is free-text from a sidebar input** — no auth, no validation, easy to spoof or typo. | In Databricks Apps deployment, read `X-Forwarded-User` from the request — workspace identity is the source of truth. Drop the sidebar input. |
-| **No "forget this user" operation** (GDPR right-to-erasure). | Add a `delete_user(user_id)` that wipes all `memories.*.<user_id>` namespaces, all checkpoints for that user's threads, and logs the deletion. |
-| **No row-level security** — all data lives in one branch, accessible by anyone with the connection string. | Use Unity Catalog ABAC/RLS to restrict `user_id` access by workspace identity. Becomes critical when multiple users share an environment. |
-| **Secrets in `.env`** — fine for local, leaks-prone for prod. | Use Databricks Secrets / Azure Key Vault; never commit env files. |
-| **No PII handling** — emails stored verbatim as namespace segments and in episode `query` text. | Hash user_ids for the namespace key; redact PII from episode payloads before persisting (regex on common patterns, or run through an LLM-based scrubber). |
-
-## UX / Streamlit-specific
-
-| Limitation | Production evolution |
-|---|---|
-| **Streamlit reruns the entire script on every interaction** — sidebar memory panels re-query Lakebase on every keystroke in the chat input. | Cache panel reads in `st.session_state` with TTL; invalidate on known write events. |
-| **No way to switch to a past thread** — sidebar lists past sessions but can't reload one. | Add a click-to-load action on each session entry; restore the conversation via the existing `thread_id` and have the checkpointer hydrate the history. |
-| **No pagination on past sessions** — `limit=500` is the hard cap. | Add `LIMIT/OFFSET` pagination and a "load more" affordance, or summarize sessions older than N days into a single "archive" entry. |
-| **No streaming for the distillation pass** — user sees a blocking spinner. | Stream tokens from the distiller LLM into a status panel so the user can watch it think. |
+| All store/checkpoint ops are **sync** — fine for Streamlit, blocks the event loop. | Async checkpointer + store + FastAPI handlers for the Databricks Apps deploy. |
+| `user_id` is free-text from the sidebar — spoofable, typo-prone. | Read workspace identity (`X-Forwarded-User`) in the Apps deploy; drop the input. |
+| No "forget this user" (GDPR), no row-level security, no PII handling. | `delete_user(user_id)` wipe; UC ABAC/RLS by identity; hash user_ids + redact PII. |
+| Secrets live in `.env`; no Lakebase token refresh for multi-hour workers; no distillation retry. | Databricks Secrets; retry-on-401 re-auth; backoff + stricter retry on malformed JSON. |
 
 ## Testing & deployment
 
 | Limitation | Production evolution |
 |---|---|
-| **Zero automated test coverage**. | Add: (a) unit tests with mock store/LLM for `persist_episode`, `load_memory_context`, distillation merge logic. (b) integration tests against an ephemeral Lakebase branch (`experiment-test-*`) that gets torn down after CI runs. |
-| **No CI/CD** — purely local development. | GitHub Actions: lint + unit tests on every PR; integration tests against an ephemeral branch on `main`. Auto-deploy to a staging Databricks App on merge. |
-| **No rate limiting** — a runaway client could hammer the model endpoint. | Token bucket per user_id; surface 429s gracefully in the UI. |
-| **No deployment story yet** — that's Part 3. | Part 3: package as a Databricks App + add the scheduled distillation Job + swap sync→async + bind to workspace identity. |
-
----
-
-These are intentionally listed up front so anyone reading the code knows
-where the seams are. Part 3 (or beyond) is where most of these get hardened.
+| Zero test coverage, no CI/CD, no rate limiting. | Unit tests (mock store/LLM) + integration tests on an ephemeral branch; GitHub Actions; per-user token bucket. |
+| No deployment story yet. | **Part 3**: package as a Databricks App + scheduled distillation Job + sync→async + workspace identity. |

@@ -8,7 +8,8 @@ Two namespaces per user_id (down from three — no L1 explicit channel):
 There are NO memory tools the supervisor LLM can call. Memory is purely
 automatic:
   - WRITE: persist_episode (graph node) at end of every turn
-  - READ:  load_memory_context (called inside supervisor_node) at start of every turn
+  - READ:  load_semantic_context (once per thread) + load_episodic_context
+           (every turn), assembled into the supervisor's "working memory"
   - CONSOLIDATE: distill_user (in distiller.py), triggered at session end
 
 This keeps the per-turn LLM call cheap — no extra tool the supervisor has to
@@ -115,42 +116,53 @@ def get_session_summaries(store: BaseStore, user_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Context loading — called inside supervisor_node before the LLM call
+# Context loading — assembles the supervisor's "working memory" (MemAlign term)
+#
+# Split into two functions because the two reads have different lifetimes:
+#   - semantic is query-INdependent  -> load once per thread, then cache
+#   - episodic is query-DEPENDENT    -> reload every turn (similarity to query)
 # ---------------------------------------------------------------------------
 
-def load_memory_context(store: BaseStore, *, user_id: str, query: str) -> str:
-    """Format relevant memories into one string for the supervisor's prompt.
+def load_semantic_context(store: BaseStore, *, user_id: str) -> str:
+    """KNOWN_USER_PREFERENCES block — ALL semantic prefs, no vector search.
 
-    Strategy:
-      - Pull ALL semantic for this user (small per-user table, no vector search).
-      - Pull top-3 episodic by similarity to the current query.
+    Query-independent (same result regardless of the current question), so the
+    caller loads this once at the start of a thread and reuses the cached value.
     """
-    parts: list[str] = []
-
     semantic = store.search(semantic_ns(user_id), limit=20) or []
-    if semantic:
-        parts.append("KNOWN_USER_PREFERENCES:")
-        for item in semantic:
-            val = item.value
-            display = val.get(
-                "value",
-                json.dumps({k: v for k, v in val.items() if k != "updated_at"}),
-            )
-            conf = val.get("confidence")
-            stated = " · user-stated" if val.get("stated_by_user") else ""
-            if isinstance(conf, (int, float)):
-                suffix = f"  (conf {conf:.2f}{stated})"
-            else:
-                suffix = f"  ({stated.strip(' ·')})" if stated else ""
-            parts.append(f"  - {item.key}: {display}{suffix}")
+    if not semantic:
+        return ""
 
+    parts = ["KNOWN_USER_PREFERENCES:"]
+    for item in semantic:
+        val = item.value
+        display = val.get(
+            "value",
+            json.dumps({k: v for k, v in val.items() if k != "updated_at"}),
+        )
+        conf = val.get("confidence")
+        stated = " · user-stated" if val.get("stated_by_user") else ""
+        if isinstance(conf, (int, float)):
+            suffix = f"  (conf {conf:.2f}{stated})"
+        else:
+            suffix = f"  ({stated.strip(' ·')})" if stated else ""
+        parts.append(f"  - {item.key}: {display}{suffix}")
+    return "\n".join(parts)
+
+
+def load_episodic_context(store: BaseStore, *, user_id: str, query: str) -> str:
+    """RELATED_PAST_INTERACTIONS block — top-3 episodes by pgvector similarity.
+
+    Query-dependent, so the caller reloads this every turn.
+    """
     episodic = store.search(episodic_ns(user_id), query=query, limit=3) or []
-    if episodic:
-        parts.append("RELATED_PAST_INTERACTIONS:")
-        for item in episodic:
-            v = item.value
-            when = (v.get("occurred_at") or "?")[:10]
-            used = ", ".join(v.get("subagents_used") or []) or "no sub-agents"
-            parts.append(f"  - ({when}) \"{v.get('query', '')}\"  → used: {used}")
+    if not episodic:
+        return ""
 
+    parts = ["RELATED_PAST_INTERACTIONS:"]
+    for item in episodic:
+        v = item.value
+        when = (v.get("occurred_at") or "?")[:10]
+        used = ", ".join(v.get("subagents_used") or []) or "no sub-agents"
+        parts.append(f"  - ({when}) \"{v.get('query', '')}\"  → used: {used}")
     return "\n".join(parts)
