@@ -1,7 +1,9 @@
 # LangGraph Supervisor on Databricks
-
 A LangGraph supervisor agent that delegates to specialist sub-agents (weather +
 finance), running against Databricks foundation models. Built up over two parts.
+
+## [YouTube Memory Enablement Series](A LangGraph supervisor agent that delegates to specialist sub-agents (weather +
+finance), running against Databricks foundation models. Built up over two parts.)
 
 ## Directories
 
